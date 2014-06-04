@@ -8,6 +8,7 @@ import scala.util.control.NoStackTrace
 import com.typesafe.config._
 import akka.actor._
 import akka.testkit._
+import akka.persistence.ReliableRedelivery.ReliableRedeliverySnapshot
 
 object ReliableRedeliverySpec {
 
@@ -22,6 +23,8 @@ object ReliableRedeliverySpec {
   case class Action(id: Long, payload: String)
   case class ActionAck(id: Long)
   case object Boom
+  case object SaveSnap
+  case class Snap(deliverySnapshot: ReliableRedeliverySnapshot) // typically includes some user data as well
 
   def sndProps(name: String, redeliverInterval: FiniteDuration, destinations: Map[String, ActorPath]): Props =
     Props(new Sender(name, redeliverInterval, destinations))
@@ -33,8 +36,7 @@ object ReliableRedeliverySpec {
 
     def updateState(evt: Evt): Unit = evt match {
       case AcceptedReq(payload, destination) ⇒
-        val seqNr = nextDeliverySequenceNr(destination)
-        deliver(seqNr, destination, Action(seqNr, payload))
+        deliver(destination, seqNr => Action(seqNr, payload))
       case ReqDone(id) ⇒
         confirmDelivery(id)
     }
@@ -60,10 +62,17 @@ object ReliableRedeliverySpec {
       case Boom ⇒
         throw new RuntimeException("boom") with NoStackTrace
 
+      case SaveSnap =>
+        saveSnapshot(Snap(getDeliverySnapshot))
+
     }
 
     def receiveRecover: Receive = {
       case evt: Evt ⇒ updateState(evt)
+      case SnapshotOffer(_, Snap(deliverySnapshot)) =>
+        println("# got snap: " + deliverySnapshot)
+        setDeliverySnapshot(deliverySnapshot)
+
     }
   }
 
@@ -171,6 +180,40 @@ abstract class ReliableRedeliverySpec(config: Config) extends AkkaSpec(config) w
       probeA.expectNoMsg(1.second)
     }
 
+    "must restore state from snapshot" in {
+      val probeA = TestProbe()
+      val dst = system.actorOf(destinationProps(probeA.ref))
+      val destinations = Map("A" -> system.actorOf(unreliableProps(3, dst)).path)
+      val snd = system.actorOf(sndProps(name, 500.millis, destinations), name)
+      snd ! Req("a-1")
+      expectMsg(ReqAck)
+      probeA.expectMsg(Action(1, "a-1"))
+
+      snd ! Req("a-2")
+      expectMsg(ReqAck)
+      probeA.expectMsg(Action(2, "a-2"))
+
+      snd ! Req("a-3")
+      snd ! Req("a-4")
+      snd ! SaveSnap
+      expectMsg(ReqAck)
+      expectMsg(ReqAck)
+      // a-3 was lost
+      probeA.expectMsg(Action(4, "a-4"))
+
+      // trigger restart
+      snd ! Boom
+
+      // and then re-delivered
+      probeA.expectMsg(Action(3, "a-3"))
+
+      snd ! Req("a-5")
+      expectMsg(ReqAck)
+      probeA.expectMsg(Action(5, "a-5"))
+
+      probeA.expectNoMsg(1.second)
+    }
+
     "must re-deliver many lost messages" in {
       val probeA = TestProbe()
       val probeB = TestProbe()
@@ -197,6 +240,7 @@ abstract class ReliableRedeliverySpec(config: Config) extends AkkaSpec(config) w
       probeB.receiveN(N).map { case a: Action ⇒ a.payload }.toSet should be((1 to N).map(n ⇒ "b-" + n).toSet)
       probeC.receiveN(N).map { case a: Action ⇒ a.payload }.toSet should be((1 to N).map(n ⇒ "c-" + n).toSet)
     }
+
   }
 }
 

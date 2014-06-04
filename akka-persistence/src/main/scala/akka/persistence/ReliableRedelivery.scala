@@ -4,23 +4,34 @@
 package akka.persistence
 
 import scala.annotation.tailrec
+import scala.collection.breakOut
 import scala.collection.immutable
 import scala.concurrent.duration.FiniteDuration
 import akka.actor.Actor
 import akka.actor.ActorPath
 
-/**
- * INTERNAL API
- */
-private[akka] object ReliableRedelivery {
+object ReliableRedelivery {
 
-  case class Delivery(seqNr: Long, destination: ActorPath, msg: Any, timestamp: Long, attempt: Int)
-  case object RedeliveryTick
+  @SerialVersionUID(1L)
+  case class ReliableRedeliverySnapshot(currentSeqNr: Long, unconfirmedDeliveries: immutable.Seq[UnconfirmedDelivery]) {
+
+    // FIXME Java api
+    // FIXME protobuf serialization
+
+  }
+
+  case class UnconfirmedDelivery(seqNr: Long, destination: ActorPath, msg: Any)
+
+  object Internal {
+    case class Delivery(destination: ActorPath, msg: Any, timestamp: Long, attempt: Int)
+    case object RedeliveryTick
+  }
 
 }
 
 trait ReliableRedelivery extends PersistentActor {
   import ReliableRedelivery._
+  import ReliableRedelivery.Internal._
 
   def redeliverInterval: FiniteDuration
 
@@ -33,24 +44,26 @@ trait ReliableRedelivery extends PersistentActor {
   private var deliverySequenceNr = 0L
   private var unconfirmed = immutable.SortedMap.empty[Long, Delivery]
 
-  def nextDeliverySequenceNr(destination: ActorPath): Long = {
-    // FIXME one counter sequence per destination
+  private def nextDeliverySequenceNr(): Long = {
+    // FIXME one counter sequence per destination?
     deliverySequenceNr += 1
     deliverySequenceNr
   }
 
-  def deliver(deliverySequenceNr: Long, destination: ActorPath, msg: Any): Unit = {
-    require(!unconfirmed.contains(deliverySequenceNr), s"deliverySequenceNr [$deliverySequenceNr] already in use")
-    val d = Delivery(deliverySequenceNr, destination, msg, System.nanoTime(), attempt = 0)
+  def deliver(destination: ActorPath, seqNrToMessage: Long => Any): Unit = {
+    val seqNr = nextDeliverySequenceNr()
+    val d = Delivery(destination, seqNrToMessage(seqNr), System.nanoTime(), attempt = 0)
     if (recoveryRunning)
-      unconfirmed = unconfirmed.updated(deliverySequenceNr, d)
+      unconfirmed = unconfirmed.updated(seqNr, d)
     else
-      send(d)
+      send(seqNr, d)
   }
 
-  def confirmDelivery(deliverySequenceNr: Long): Boolean = {
-    if (unconfirmed.contains(deliverySequenceNr)) {
-      unconfirmed -= deliverySequenceNr
+  // FIXME Java API for deliver
+
+  def confirmDelivery(seqNr: Long): Boolean = {
+    if (unconfirmed.contains(seqNr)) {
+      unconfirmed -= seqNr
       true
     } else false
   }
@@ -60,10 +73,10 @@ trait ReliableRedelivery extends PersistentActor {
     val deadline = System.nanoTime() - redeliverInterval.toNanos
     @tailrec def loop(): Unit = {
       if (iter.hasNext) {
-        val (_, delivery) = iter.next()
+        val (seqNr, delivery) = iter.next()
         // skip all after deadline, since they are added in seqNo order 
         if (delivery.timestamp <= deadline) {
-          send(delivery)
+          send(seqNr, delivery)
           loop()
         }
       }
@@ -71,9 +84,20 @@ trait ReliableRedelivery extends PersistentActor {
     loop()
   }
 
-  private def send(d: Delivery): Unit = {
+  private def send(seqNr: Long, d: Delivery): Unit = {
     context.actorSelection(d.destination) ! d.msg
-    unconfirmed = unconfirmed.updated(d.seqNr, d.copy(timestamp = System.nanoTime(), attempt = d.attempt + 1))
+    unconfirmed = unconfirmed.updated(seqNr, d.copy(timestamp = System.nanoTime(), attempt = d.attempt + 1))
+  }
+
+  def getDeliverySnapshot: ReliableRedeliverySnapshot =
+    ReliableRedeliverySnapshot(deliverySequenceNr,
+      unconfirmed.map { case (seqNr, d) => UnconfirmedDelivery(seqNr, d.destination, d.msg) }(breakOut))
+
+  def setDeliverySnapshot(snapshot: ReliableRedeliverySnapshot): Unit = {
+    deliverySequenceNr = snapshot.currentSeqNr
+    val now = System.nanoTime()
+    unconfirmed = snapshot.unconfirmedDeliveries.map(d =>
+      d.seqNr -> Delivery(d.destination, d.msg, now, 0))(breakOut)
   }
 
   override protected[akka] def aroundPreRestart(reason: Throwable, message: Option[Any]): Unit = {
