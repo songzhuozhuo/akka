@@ -27,17 +27,16 @@ object ReliableRedeliverySpec {
     Props(new Sender(name, redeliverInterval, destinations))
 
   class Sender(name: String, override val redeliverInterval: FiniteDuration, destinations: Map[String, ActorPath])
-    extends ReliableRedelivery with EventsourcedProcessor {
-    // FIXME aroundPreRestart final in Processor, and therefore mixin order matters
+    extends PersistentActor with ReliableRedelivery {
 
     override def processorId: String = name
 
     def updateState(evt: Evt): Unit = evt match {
       case AcceptedReq(payload, destination) ⇒
         val seqNr = nextDeliverySequenceNr(destination)
-        addDelivery(seqNr, destination, Action(seqNr, payload))
+        deliver(seqNr, destination, Action(seqNr, payload))
       case ReqDone(id) ⇒
-        confirm(id)
+        confirmDelivery(id)
     }
 
     val receiveCommand: Receive = {
@@ -49,12 +48,11 @@ object ReliableRedeliverySpec {
           persist(AcceptedReq(payload, destination)) { evt ⇒
             updateState(evt)
             sender() ! ReqAck
-            sendAddedDeliveries()
           }
         }
 
       case ActionAck(id) ⇒
-        if (confirm(id))
+        if (confirmDelivery(id))
           persist(ReqDone(id)) { evt ⇒
             updateState(evt)
           }
