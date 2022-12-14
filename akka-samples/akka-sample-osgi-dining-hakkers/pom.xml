@@ -16,7 +16,7 @@
         <osgi.version>4.3.1</osgi.version>
         <paxexam.version>2.6.0</paxexam.version>
         <paxswissbox.version>1.6.0</paxswissbox.version>
-        <protobuf.version>2.5.0</protobuf.version>
+        <protobuf.version>3.16.3</protobuf.version>
         <scala.version>2.10.4</scala.version>
         <scala.dep.version>2.10</scala.dep.version>
         <scalatest.version>2.0</scalatest.version>
